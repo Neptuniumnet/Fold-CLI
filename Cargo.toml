@@ -1,6 +1,6 @@
 [package]
-name = "fold"
-version = "0.1.0"
+name = "foldcli"
+version = "0.1.1"
 edition = "2021"
 description = "FOLD: a keyboard-first terminal file manager. Your files, in flow."
 rust-version = "1.75"
