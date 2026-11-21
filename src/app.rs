@@ -1,4 +1,3 @@
-//! Application state and behaviour.
 //!
 //! `App` owns everything that changes while FOLD runs: which folder we're in,
 //! where the cursor is, which dialog is open, and so on. `on_key` is the one
@@ -12,8 +11,12 @@ use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static UNDO_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
@@ -98,6 +101,27 @@ pub struct Clipboard {
 pub enum Confirm {
     Delete(Vec<PathBuf>),
     Overwrite { op: Op, plan: PastePlan },
+    Undo(String),
+}
+
+#[derive(Clone, Debug)]
+enum UndoStep {
+    RemoveCreated(PathBuf),
+    MoveBack { from: PathBuf, to: PathBuf },
+    RestoreBackup { backup: PathBuf, original: PathBuf },
+}
+
+#[derive(Clone, Debug)]
+struct UndoRecord {
+    label: String,
+    steps: Vec<UndoStep>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContentMatch {
+    pub path: PathBuf,
+    pub line: usize,
+    pub text: String,
 }
 
 pub enum Mode {
@@ -118,6 +142,12 @@ pub enum Mode {
         selected: usize,
     },
     Bookmarks {
+        selected: usize,
+    },
+    ContentSearch(Input),
+    SearchResults {
+        query: String,
+        matches: Vec<ContentMatch>,
         selected: usize,
     },
     TextViewer {
@@ -154,6 +184,7 @@ pub struct App {
     saved_theme_choice: Option<usize>,
     pub bookmarks: Vec<PathBuf>,
     pub show_icons: bool,
+    last_undo: Option<UndoRecord>,
     /// False = plain ASCII fallback for terminals without box drawing.
     pub unicode: bool,
 }
@@ -192,7 +223,7 @@ fn load_settings() -> (Option<usize>, bool) {
         .get("theme")
         .and_then(serde_json::Value::as_u64)
         .map(|index| index as usize)
-        .filter(|index| *index <= 4);
+        .filter(|index| *index <= 8);
     let icons = value
         .get("show_icons")
         .and_then(serde_json::Value::as_bool)
@@ -243,6 +274,144 @@ fn theme_for_choice(index: usize) -> Theme {
     } else {
         crate::theme::preset(index)
     }
+}
+
+fn undo_backup_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    loop {
+        let id = UNDO_ID.fetch_add(1, Ordering::Relaxed);
+        let backup = parent.join(format!(".foldcli-undo-{}-{id}", std::process::id()));
+        if fs::symlink_metadata(&backup).is_err() {
+            return backup;
+        }
+    }
+}
+
+fn path_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+fn search_contents(root: &Path, query: &str, show_hidden: bool) -> Vec<ContentMatch> {
+    const MAX_RESULTS: usize = 250;
+    const MAX_FILES: usize = 20_000;
+    const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+    let needle = query.to_lowercase();
+    let mut pending = vec![root.to_path_buf()];
+    let mut matches = Vec::new();
+    let mut scanned = 0usize;
+    let mut total_bytes = 0u64;
+    while let Some(dir_path) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            if !show_hidden && name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            scanned += 1;
+            if scanned > MAX_FILES {
+                return matches;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            let size = metadata.len();
+            if size > MAX_FILE_SIZE || !is_text_file(&path) {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(size);
+            if total_bytes > MAX_TOTAL_BYTES {
+                return matches;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for (index, line) in text.lines().enumerate() {
+                if line.to_lowercase().contains(&needle) {
+                    matches.push(ContentMatch {
+                        path: path.clone(),
+                        line: index + 1,
+                        text: line.to_string(),
+                    });
+                    if matches.len() >= MAX_RESULTS {
+                        return matches;
+                    }
+                }
+            }
+        }
+    }
+    matches
+}
+
+fn copy_to_system_clipboard(text: &str) -> Result<(), String> {
+    let commands: [(&str, &[&str]); 3] = [
+        ("wl-copy", &["--type", "text/plain;charset=utf-8"]),
+        ("xclip", &["-selection", "clipboard", "-i"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (program, args) in commands {
+        let child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { continue };
+        let write_result = child
+            .stdin
+            .take()
+            .ok_or_else(|| "clipboard process has no input".to_string())
+            .and_then(|mut stdin| stdin.write_all(text.as_bytes()).map_err(|e| e.to_string()));
+        let status = child.wait().map_err(|e| e.to_string())?;
+        if write_result.is_ok() && status.success() {
+            return Ok(());
+        }
+    }
+
+    // OSC 52 is supported by many modern terminals and also works over SSH.
+    let encoded = base64(text.as_bytes());
+    let mut out = std::io::stdout().lock();
+    write!(out, "\x1b]52;c;{encoded}\x07").map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())
+}
+
+fn base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let a = chunk[0];
+        let b = *chunk.get(1).unwrap_or(&0);
+        let c = *chunk.get(2).unwrap_or(&0);
+        result.push(TABLE[(a >> 2) as usize] as char);
+        result.push(TABLE[(((a & 3) << 4) | (b >> 4)) as usize] as char);
+        result.push(if chunk.len() > 1 {
+            TABLE[(((b & 15) << 2) | (c >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        result.push(if chunk.len() > 2 {
+            TABLE[(c & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    result
 }
 
 fn count(n: usize) -> String {
@@ -351,6 +520,7 @@ impl App {
             saved_theme_choice,
             bookmarks: load_bookmarks(),
             show_icons,
+            last_undo: None,
             unicode,
         };
         app.refresh_visible(None, true);
@@ -637,6 +807,24 @@ impl App {
             }
             Mode::Settings { selected } => self.on_settings(key, selected),
             Mode::Bookmarks { selected } => self.on_bookmarks(key, selected),
+            Mode::ContentSearch(mut input) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => {
+                    let query = input.value().trim().to_string();
+                    if !query.is_empty() {
+                        self.run_content_search(query);
+                    }
+                }
+                _ => {
+                    input.handle_key(&key);
+                    self.mode = Mode::ContentSearch(input);
+                }
+            },
+            Mode::SearchResults {
+                query,
+                matches,
+                selected,
+            } => self.on_search_results(key, query, matches, selected),
             Mode::Message { .. } | Mode::Help => {} // any key closes it
         }
     }
@@ -691,6 +879,108 @@ impl App {
             Action::Settings => self.mode = Mode::Settings { selected: 0 },
             Action::BookmarkAdd => self.add_bookmark(),
             Action::BookmarksOpen => self.mode = Mode::Bookmarks { selected: 0 },
+            Action::CopyAddress => self.copy_addresses(),
+            Action::CopyDirectoryAddress => self.copy_directory_address(),
+            Action::ContentSearch => self.mode = Mode::ContentSearch(Input::default()),
+            Action::Undo => match &self.last_undo {
+                Some(record) => self.mode = Mode::Confirm(Confirm::Undo(record.label.clone())),
+                None => self.info("Nothing to undo"),
+            },
+        }
+    }
+
+    fn run_content_search(&mut self, query: String) {
+        let matches = search_contents(&self.cwd, &query, self.show_hidden);
+        self.mode = Mode::SearchResults {
+            query,
+            matches,
+            selected: 0,
+        };
+    }
+
+    fn on_search_results(
+        &mut self,
+        key: KeyEvent,
+        query: String,
+        matches: Vec<ContentMatch>,
+        mut selected: usize,
+    ) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(matches.len().saturating_sub(1));
+            }
+            KeyCode::Enter if !matches.is_empty() => {
+                let found = &matches[selected];
+                match fs::read_to_string(&found.path) {
+                    Ok(text) => {
+                        self.mode = Mode::TextViewer {
+                            title: found.path.file_name().map_or_else(
+                                || found.path.display().to_string(),
+                                |name| name.to_string_lossy().into_owned(),
+                            ),
+                            lines: text.lines().map(crate::dir::sanitize).collect(),
+                            offset: found.line.saturating_sub(1),
+                        };
+                    }
+                    Err(error) => self.error(format!("Cannot open search result: {error}")),
+                }
+                return;
+            }
+            _ => {}
+        }
+        self.mode = Mode::SearchResults {
+            query,
+            matches,
+            selected,
+        };
+    }
+
+    fn copy_addresses(&mut self) {
+        let targets = self.targets();
+        let addresses = if targets.is_empty() {
+            vec![self.cwd.clone()]
+        } else {
+            targets
+        };
+        let text = addresses
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        match copy_to_system_clipboard(&text) {
+            Ok(()) => self.info(if addresses.len() == 1 {
+                "Copied path to clipboard"
+            } else {
+                "Copied paths to clipboard"
+            }),
+            Err(error) => self.error(format!("Could not copy path: {error}")),
+        }
+    }
+
+    fn copy_directory_address(&mut self) {
+        match copy_to_system_clipboard(&self.cwd.to_string_lossy()) {
+            Ok(()) => self.info("Copied current folder path to clipboard"),
+            Err(error) => self.error(format!("Could not copy path: {error}")),
+        }
+    }
+
+    pub fn open_logo_link(&mut self) {
+        match Command::new("xdg-open")
+            .arg("https://www.myinstants.com/en/instant/m-e-o-w-82698/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                self.info("Opening FOLD's meow page…");
+            }
+            Err(error) => self.error(format!("Could not open web browser: {error}")),
         }
     }
 
@@ -735,13 +1025,35 @@ impl App {
     fn on_settings(&mut self, key: KeyEvent, mut selected: usize) {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return,
-            KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(5),
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = if selected == 9 {
+                    6
+                } else {
+                    selected.saturating_sub(3)
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => selected = (selected + 3).min(9),
+            KeyCode::Left | KeyCode::Char('h') => {
+                selected = if selected == 9 {
+                    8
+                } else if selected % 3 == 0 {
+                    selected + 2
+                } else {
+                    selected - 1
+                };
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                selected = if selected == 9 {
+                    0
+                } else if selected % 3 == 2 {
+                    selected - 2
+                } else {
+                    selected + 1
+                };
+            }
             KeyCode::Enter => {
-                if selected == 5 {
+                if selected == 9 {
                     self.show_icons = !self.show_icons;
-                } else if selected == 4 {
-                    self.set_theme_choice(4);
                 } else {
                     self.set_theme_choice(selected);
                 }
@@ -849,7 +1161,70 @@ impl App {
     }
 
     fn run_plan(&mut self, op: Op, plan: PastePlan) {
-        let report = fsops::execute(op, &plan);
+        let mut report = fsops::Report::default();
+        let mut steps = Vec::new();
+        for item in &plan.items {
+            let mut backup = None;
+            if item.overwrite {
+                let staged = undo_backup_path(&item.dst);
+                match fs::rename(&item.dst, &staged) {
+                    Ok(()) => {
+                        backup = Some(staged.clone());
+                        steps.push(UndoStep::RestoreBackup {
+                            backup: staged,
+                            original: item.dst.clone(),
+                        });
+                    }
+                    Err(error) => {
+                        report.errors.push(format!(
+                            "{}: could not stage the item being replaced: {error}",
+                            fsops::display_name(&item.dst)
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let result = match op {
+                Op::Copy => fsops::copy_path(&item.src, &item.dst),
+                Op::Move => fsops::move_path(&item.src, &item.dst),
+            };
+            match result {
+                Ok(()) => {
+                    report.done += 1;
+                    match op {
+                        Op::Copy => steps.push(UndoStep::RemoveCreated(item.dst.clone())),
+                        Op::Move => steps.push(UndoStep::MoveBack {
+                            from: item.dst.clone(),
+                            to: item.src.clone(),
+                        }),
+                    }
+                }
+                Err(error) => {
+                    if path_exists(&item.dst) && (op == Op::Copy || path_exists(&item.src)) {
+                        let _ = fsops::delete_path(&item.dst);
+                    }
+                    if let Some(staged) = backup {
+                        if fs::rename(&staged, &item.dst).is_ok() {
+                            steps.pop();
+                        } else {
+                            report.errors.push(format!(
+                                "{}: operation failed ({error}); original is preserved at {}",
+                                fsops::display_name(&item.dst),
+                                staged.display()
+                            ));
+                            continue;
+                        }
+                    }
+                    report.errors.push(error.to_string());
+                }
+            }
+        }
+        if !steps.is_empty() {
+            self.install_undo(UndoRecord {
+                label: format!("{} {}", op.past().to_ascii_lowercase(), count(report.done)),
+                steps,
+            });
+        }
         let first = plan.items.first().map(|i| i.dst.clone());
         if op == Op::Move {
             self.clipboard = None;
@@ -914,6 +1289,13 @@ impl App {
                 }
                 match fsops::rename_path(&target, &new_name) {
                     Ok(new_path) => {
+                        self.install_undo(UndoRecord {
+                            label: "rename".into(),
+                            steps: vec![UndoStep::MoveBack {
+                                from: new_path.clone(),
+                                to: target.clone(),
+                            }],
+                        });
                         self.reload(Some(new_path));
                         self.info(format!("Renamed to {}", dir::sanitize(&new_name)));
                     }
@@ -956,18 +1338,106 @@ impl App {
             Confirm::Delete(paths) => {
                 let mut done = 0;
                 let mut errors = Vec::new();
+                let mut steps = Vec::new();
                 for path in &paths {
-                    match fsops::delete_path(path) {
-                        Ok(()) => done += 1,
-                        Err(e) => errors.push(e.to_string()),
+                    let backup = undo_backup_path(path);
+                    match fs::rename(path, &backup) {
+                        Ok(()) => {
+                            done += 1;
+                            steps.push(UndoStep::RestoreBackup {
+                                backup,
+                                original: path.clone(),
+                            });
+                        }
+                        Err(error) => errors.push(format!("{}: {error}", path.display())),
                     }
+                }
+                if !steps.is_empty() {
+                    self.install_undo(UndoRecord {
+                        label: format!("delete {}", count(done)),
+                        steps,
+                    });
                 }
                 self.selected.clear();
                 self.reload(None);
-                self.report("Deleted", done, errors);
+                self.report("Deleted (undo available)", done, errors);
             }
             Confirm::Overwrite { op, plan } => self.run_plan(op, plan),
+            Confirm::Undo(_) => self.undo_last(),
         }
+    }
+
+    fn install_undo(&mut self, record: UndoRecord) {
+        self.discard_undo_backups();
+        self.last_undo = Some(record);
+    }
+
+    fn discard_undo_backups(&mut self) {
+        if let Some(record) = self.last_undo.take() {
+            for step in record.steps {
+                if let UndoStep::RestoreBackup { backup, .. } = step {
+                    if path_exists(&backup) {
+                        let _ = fsops::delete_path(&backup);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn undo_available(&self) -> bool {
+        self.last_undo.is_some()
+    }
+
+    pub fn cleanup_undo_backups(&mut self) {
+        self.discard_undo_backups();
+    }
+
+    fn undo_last(&mut self) {
+        let Some(mut record) = self.last_undo.take() else {
+            self.info("Nothing to undo");
+            return;
+        };
+        while let Some(step) = record.steps.pop() {
+            let result = match &step {
+                UndoStep::RemoveCreated(path) => {
+                    if path_exists(path) {
+                        fsops::delete_path(path)
+                    } else {
+                        Ok(())
+                    }
+                }
+                UndoStep::MoveBack { from, to } => {
+                    if path_exists(to) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("{} already exists", to.display()),
+                        ))
+                    } else {
+                        fsops::move_path(from, to)
+                    }
+                }
+                UndoStep::RestoreBackup { backup, original } => {
+                    if path_exists(original) {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("{} already exists", original.display()),
+                        ))
+                    } else {
+                        fsops::move_path(backup, original)
+                    }
+                }
+            };
+            if let Err(error) = result {
+                record.steps.push(step);
+                self.last_undo = Some(record);
+                self.error(format!("Undo stopped: {error}"));
+                self.reload(None);
+                return;
+            }
+        }
+        let label = record.label;
+        self.reload(None);
+        self.info(format!("Undid {label}"));
     }
 }
 
@@ -1325,8 +1795,4 @@ mod tests {
         code(&mut app, KeyCode::Enter);
         assert!(d.path().join(OsStr::from_bytes(b"caf\xe9.txt")).exists());
         // Delete flow works on it too.
-        press(&mut app, 'd');
-        press(&mut app, 'y');
-        assert!(fs::read_dir(d.path()).unwrap().next().is_none());
-    }
-}
+ 
