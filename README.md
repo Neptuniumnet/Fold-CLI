@@ -64,7 +64,7 @@ file management experience. The UI is inspired by the
 Install Rust 1.75 or newer, then run:
 
 ```sh
-git clone https://github.com/Neptunium-Laboratory/Fold-CLI.git
+git clone https://github.com/Neptuniumnet/Fold-CLI.git
 cd Fold-CLI
 cargo build --release
 ```
