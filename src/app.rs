@@ -1795,4 +1795,9 @@ mod tests {
         code(&mut app, KeyCode::Enter);
         assert!(d.path().join(OsStr::from_bytes(b"caf\xe9.txt")).exists());
         // Delete flow works on it too.
- 
+        press(&mut app, 'd');
+        assert!(matches!(app.mode, Mode::Confirm(Confirm::Delete(_))));
+        code(&mut app, KeyCode::Char('n'));
+        assert!(d.path().join(OsStr::from_bytes(b"caf\xe9.txt")).exists());
+    }
+}

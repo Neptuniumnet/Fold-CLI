@@ -1,1 +1,24 @@
-/target
+# Build output
+/target/
+**/*.rs.bk
+
+# Local agent/tooling metadata
+.agents/
+.codex/
+.aws/
+
+# Package/IDE metadata
+*.pdb
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local environment
+.env
+.env.*

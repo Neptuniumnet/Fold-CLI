@@ -1,0 +1,30 @@
+# Maintainer: space.ixc
+pkgname=foldcli
+pkgver=0.1.1
+pkgrel=1
+pkgdesc='Keyboard-first terminal file manager'
+arch=('x86_64' 'aarch64')
+url='https://github.com/Neptunium-Laboratory/Fold-CLI'
+license=('GPL3')
+depends=('gcc-libs' 'xdg-utils')
+makedepends=('rust')
+source=("git+https://github.com/Neptunium-Laboratory/Fold-CLI.git#tag=v${pkgver}")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$srcdir/Fold-CLI"
+  # Keep Cargo from changing the lockfile during a package build.
+  cargo fetch --locked
+}
+
+build() {
+  cd "$srcdir/Fold-CLI"
+  cargo build --release --locked --offline
+}
+
+package() {
+  cd "$srcdir/Fold-CLI"
+  install -Dm755 target/release/foldcli "$pkgdir/usr/bin/foldcli"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/foldcli/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/foldcli/LICENSE"
+}

@@ -19,7 +19,10 @@ mod kitty;
 mod theme;
 mod ui;
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use std::io::{self, IsTerminal};
@@ -32,7 +35,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("fold: {message}");
+            eprintln!("foldcli: {message}");
             ExitCode::FAILURE
         }
     }
@@ -68,7 +71,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     if cli.version {
-        println!("fold {}", env!("CARGO_PKG_VERSION"));
+        println!("foldcli {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -113,7 +116,12 @@ fn run() -> Result<(), String> {
     // `ratatui::init` switches to the alternate screen, enables raw mode and
     // installs a panic hook that restores the terminal.
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut app, &stop);
+    let result = (|| {
+        crossterm::execute!(io::stdout(), EnableMouseCapture)?;
+        event_loop(&mut terminal, &mut app, &stop)
+    })();
+    app.cleanup_undo_backups();
+    let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
     // Always restore, whether the loop ended normally or with an error.
     ratatui::restore();
     result.map_err(|e| format!("terminal error: {e}"))
@@ -137,7 +145,8 @@ fn event_loop(
             terminal.draw(|frame| ui::draw(frame, app))?;
             if showing_kitty_image {
                 if let app::Mode::ImageViewer { image, .. } = &app.mode {
-                    let area = terminal.size()?;
+                    let size = terminal.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
                     kitty::show(image, area.width, area.height)?;
                     kitty_image_visible = true;
                 }
@@ -149,6 +158,17 @@ fn event_loop(
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     app.on_key(key);
+                    dirty = true;
+                }
+                Event::Mouse(mouse)
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                        && matches!(&app.mode, app::Mode::Settings { .. }) =>
+                {
+                    let size = terminal.size()?;
+                    let area = Rect::new(0, 0, size.width, size.height);
+                    if ui::logo_hit(area, mouse.column, mouse.row) {
+                        app.open_logo_link();
+                    }
                     dirty = true;
                 }
                 Event::Resize(..) => dirty = true,

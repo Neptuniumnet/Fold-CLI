@@ -5,12 +5,14 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 pub const HELP: &str = "\
-FOLD - your files, in flow. A keyboard-first terminal file manager.
+foldcli - FOLD: a keyboard-first terminal file manager.
 
 USAGE:
-    fold [OPTIONS] [DIRECTORY]
+    foldcli [OPTIONS] [DIRECTORY]
+    foldcli --path <DIRECTORY>
 
 OPTIONS:
+    --path <PATH>    Start in this directory (or pass a positional directory)
     --theme <PATH>   Colour file (Spicetify-style color.ini) or a folder containing one
     --matugen <IMAGE> Generate FOLD colours from an image using Matugen
     -h, --help       Show this help
@@ -52,6 +54,15 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Cli, String> {
             "--" => only_paths = true,
             "-h" | "--help" => cli.help = true,
             "-V" | "--version" => cli.version = true,
+            "--path" => {
+                let value = args.next().ok_or("--path needs a directory")?;
+                if value.is_empty() {
+                    return Err("--path needs a directory".into());
+                }
+                if cli.start.replace(PathBuf::from(value)).is_some() {
+                    return Err("only one directory can be given".into());
+                }
+            }
             "--theme" => {
                 let value = args.next().ok_or("--theme needs a path")?;
                 if value.is_empty() || value.to_string_lossy().starts_with('-') {
@@ -80,6 +91,13 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Cli, String> {
                         return Err("--matugen needs an image path".into());
                     }
                     cli.matugen_image = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--path=") {
+                    if value.is_empty() {
+                        return Err("--path needs a directory".into());
+                    }
+                    if cli.start.replace(PathBuf::from(value)).is_some() {
+                        return Err("only one directory can be given".into());
+                    }
                 } else {
                     return Err(format!("unknown option '{other}' (try --help)"));
                 }

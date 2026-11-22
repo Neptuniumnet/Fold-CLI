@@ -402,6 +402,49 @@ pub fn preset(index: usize) -> Theme {
                 ("button", "fabd2f"),
             ],
         ),
+        // Keep the original four presets and the system-colour entry at
+        // their existing indices so saved settings remain compatible.
+        4 => return Theme::builtin(detect_truecolor()),
+        5 => (
+            "Spotify",
+            &[
+                ("main", "121212"),
+                ("text", "ffffff"),
+                ("subtext", "b3b3b3"),
+                ("card", "181818"),
+                ("button", "1ed760"),
+            ],
+        ),
+        6 => (
+            "Tokyo Night",
+            &[
+                ("main", "1a1b26"),
+                ("text", "c0caf5"),
+                ("subtext", "a9b1d6"),
+                ("card", "24283b"),
+                ("button", "7aa2f7"),
+            ],
+        ),
+        7 => (
+            "Rose Pine",
+            &[
+                ("main", "191724"),
+                ("text", "e0def4"),
+                ("subtext", "908caa"),
+                ("card", "26233a"),
+                ("button", "ebbcba"),
+            ],
+        ),
+        8 => (
+            "Dracula",
+            &[
+                ("main", "282a36"),
+                ("text", "f8f8f2"),
+                ("subtext", "bd93f9"),
+                ("card", "44475a"),
+                ("button", "ff79c6"),
+            ],
+        ),
         _ => return Theme::builtin(detect_truecolor()),
     };
     let palette = colors

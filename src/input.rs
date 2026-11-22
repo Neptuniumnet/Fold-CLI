@@ -33,6 +33,10 @@ pub enum Action {
     Settings,
     BookmarkAdd,
     BookmarksOpen,
+    CopyAddress,
+    CopyDirectoryAddress,
+    ContentSearch,
+    Undo,
 }
 
 /// Ctrl+C always quits, whatever is on screen.
@@ -78,6 +82,10 @@ pub fn normal_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('s') | KeyCode::Char('S') => Action::Settings,
         KeyCode::Char('b') => Action::BookmarkAdd,
         KeyCode::Char('B') => Action::BookmarksOpen,
+        KeyCode::Char('y') => Action::CopyAddress,
+        KeyCode::Char('Y') => Action::CopyDirectoryAddress,
+        KeyCode::Char('f') => Action::ContentSearch,
+        KeyCode::Char('u') => Action::Undo,
         KeyCode::Char('q') | KeyCode::Char('Q') => Action::Quit,
         _ => return None,
     })

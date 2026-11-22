@@ -1,0 +1,15 @@
+pkgbase = foldcli
+	pkgdesc = Keyboard-first terminal file manager
+	pkgver = 0.1.1
+	pkgrel = 1
+	url = https://github.com/Neptunium-Laboratory/Fold-CLI
+	arch = x86_64
+	arch = aarch64
+	license = GPL3
+	makedepends = rust
+	depends = gcc-libs
+	depends = xdg-utils
+	source = git+https://github.com/Neptunium-Laboratory/Fold-CLI.git#tag=v0.1.1
+	sha256sums = SKIP
+
+pkgname = foldcli

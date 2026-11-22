@@ -1,7 +1,7 @@
 //! Rendering. This file only *reads* `App` (apart from telling it how tall the
 //! list is, so scrolling works) and paints it with Ratatui.
 
-use crate::app::{App, Confirm, Level, Mode};
+use crate::app::{App, Confirm, ContentMatch, Input, Level, Mode};
 use crate::dir::{human_size, sanitize};
 use crate::fsops::display_name;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -10,6 +10,32 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
+
+const FOLD_LOGO: [&str; 6] = [
+    "███████╗ ██████╗ ██╗     ██████╗",
+    "██╔════╝██╔═══██╗██║     ██╔══██╗",
+    "█████╗  ██║   ██║██║     ██║  ██║",
+    "██╔══╝  ██║   ██║██║     ██║  ██║",
+    "██║     ╚██████╔╝███████╗██████╔╝",
+    "╚═╝      ╚═════╝ ╚══════╝╚═════╝",
+];
+const SETTINGS_CONTENT_LINES: u16 = 18;
+
+/// Whether a click falls on the FOLD logo in the settings panel.
+pub fn logo_hit(area: Rect, x: u16, y: u16) -> bool {
+    let rect = centered(area, 64, 22);
+    let inner_x = rect.x.saturating_add(1);
+    let inner_y = rect.y.saturating_add(1);
+    let inner_width = rect.width.saturating_sub(2);
+    let inner_height = rect.height.saturating_sub(2);
+    let logo_width = FOLD_LOGO[0].chars().count() as u16;
+    let x0 = inner_x + inner_width.saturating_sub(logo_width) / 2;
+    let y0 = inner_y + inner_height.saturating_sub(SETTINGS_CONTENT_LINES) / 2;
+    x >= x0
+        && x < x0.saturating_add(logo_width)
+        && y >= y0
+        && y < y0.saturating_add(FOLD_LOGO.len() as u16)
+}
 
 /// Characters used for the little bits of decoration, with a plain-ASCII set
 /// for terminals that can't show box drawing characters.
@@ -118,6 +144,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Help => draw_help(f, app, &g, area),
         Mode::Settings { selected } => draw_settings(f, app, &g, area, *selected),
         Mode::Bookmarks { selected } => draw_bookmarks(f, app, &g, area, *selected),
+        Mode::ContentSearch(input) => draw_content_search(f, app, input, area, &g),
+        Mode::SearchResults {
+            query,
+            matches,
+            selected,
+        } => draw_search_results(f, app, query, matches, *selected, area, &g),
         Mode::TextViewer {
             title,
             lines,
@@ -128,6 +160,70 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+fn draw_content_search(f: &mut Frame, app: &App, input: &Input, area: Rect, g: &Glyphs) {
+    let t = &app.theme;
+    let rect = centered(area, 68, 7);
+    let block = dialog_block(app, " Search file contents ", t.accent, g);
+    f.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let lines = vec![
+        Line::styled(
+            "Search text under the current folder:",
+            Style::new().fg(t.muted),
+        ),
+        Line::styled(input.value(), Style::new().fg(t.fg)),
+        Line::styled("enter search   esc cancel", Style::new().fg(t.muted)),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+    let cursor_x = inner.x + Line::raw(input.before_cursor()).width() as u16;
+    f.set_cursor_position((cursor_x.min(inner.right().saturating_sub(1)), inner.y + 1));
+}
+
+fn draw_search_results(
+    f: &mut Frame,
+    app: &App,
+    query: &str,
+    matches: &[ContentMatch],
+    selected: usize,
+    area: Rect,
+    g: &Glyphs,
+) {
+    let t = &app.theme;
+    let rect = centered(area, 84, area.height.saturating_sub(2).min(24));
+    let block = dialog_block(app, &format!(" Search results: {query} "), t.accent, g);
+    f.render_widget(Clear, rect);
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let capacity = inner.height.saturating_sub(2) as usize;
+    let start = selected.saturating_sub(capacity.saturating_sub(1));
+    let mut lines = Vec::new();
+    if matches.is_empty() {
+        lines.push(Line::styled(
+            "No matching text found.",
+            Style::new().fg(t.muted),
+        ));
+    } else {
+        for (index, item) in matches.iter().enumerate().skip(start).take(capacity) {
+            let line = format!("{}:{}  {}", item.path.display(), item.line, item.text);
+            let style = if index == selected {
+                Style::new()
+                    .fg(t.cursor_fg)
+                    .bg(t.cursor_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(t.fg)
+            };
+            lines.push(Line::styled(sanitize(&line), style));
+        }
+    }
+    lines.push(Line::styled(
+        "↑↓ move   enter open   esc close",
+        Style::new().fg(t.muted),
+    ));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
 fn draw_settings(f: &mut Frame, app: &App, g: &Glyphs, area: Rect, selected: usize) {
     let t = &app.theme;
     let rect = centered(area, 64, 22);
@@ -135,15 +231,7 @@ fn draw_settings(f: &mut Frame, app: &App, g: &Glyphs, area: Rect, selected: usi
     f.render_widget(Clear, rect);
     let inner = block.inner(rect);
     f.render_widget(block, rect);
-    let logo = [
-        "███████╗ ██████╗ ██╗     ██████╗",
-        "██╔════╝██╔═══██╗██║     ██╔══██╗",
-        "█████╗  ██║   ██║██║     ██║  ██║",
-        "██╔══╝  ██║   ██║██║     ██║  ██║",
-        "██║     ╚██████╔╝███████╗██████╔╝",
-        "╚═╝      ╚═════╝ ╚══════╝╚═════╝",
-    ];
-    let mut lines: Vec<Line> = logo
+    let mut lines: Vec<Line> = FOLD_LOGO
         .iter()
         .map(|line| Line::styled(*line, Style::new().fg(t.accent)))
         .collect();
@@ -167,28 +255,43 @@ fn draw_settings(f: &mut Frame, app: &App, g: &Glyphs, area: Rect, selected: usi
         "Osaka Jane",
         "One Dark",
         "Gruvbox",
-        "Matugen / terminal colors",
+        "Matugen / System",
+        "Spotify",
+        "Tokyo Night",
+        "Rose Pine",
+        "Dracula",
     ];
-    for (index, choice) in choices.iter().enumerate() {
-        let is_selected = index == selected;
-        let active = app.theme_choice == Some(index);
-        let marker = if is_selected { "› " } else { "  " };
-        let suffix = if active { "  ✓ active" } else { "" };
-        let style = if is_selected {
-            Style::new()
-                .fg(t.cursor_fg)
-                .bg(t.cursor_bg)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::new().fg(t.fg)
-        };
-        lines.push(Line::styled(format!("{marker}{choice}{suffix}"), style));
+    for row in 0..3 {
+        let mut spans = Vec::new();
+        for column in 0..3 {
+            let index = row * 3 + column;
+            let choice = choices[index];
+            let active = app.theme_choice == Some(index);
+            let label = if active {
+                format!("{choice} *")
+            } else {
+                choice.to_string()
+            };
+            let style = if index == selected {
+                Style::new()
+                    .fg(t.cursor_fg)
+                    .bg(t.cursor_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(t.fg)
+            };
+            spans.push(Span::styled(format!(" {:^16} ", label), style));
+            if column < 2 {
+                spans.push(Span::raw(" "));
+            }
+        }
+        lines.push(Line::from(spans));
     }
     lines.push(Line::styled(
-        format!("Current palette: {}", app.theme.source),
+        format!("Current palette: {}  (* active)", app.theme.source),
         Style::new().fg(t.muted),
     ));
-    let icon_style = if selected == 5 {
+    let icon_style = if selected == 9 {
         Style::new()
             .fg(t.cursor_fg)
             .bg(t.cursor_bg)
@@ -201,7 +304,7 @@ fn draw_settings(f: &mut Frame, app: &App, g: &Glyphs, area: Rect, selected: usi
         icon_style,
     ));
     lines.push(Line::styled(
-        "↑↓ select   enter apply / toggle   esc close",
+        "arrows choose   enter apply/toggle   click logo   esc close",
         Style::new().fg(t.muted),
     ));
     f.render_widget(Paragraph::new(lines).centered(), inner);
@@ -625,6 +728,9 @@ fn normal_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         (".", "hidden"),
         ("↑↓", "move"),
     ]);
+    if app.undo_available() {
+        v.push(("u", "undo last change"));
+    }
     v
 }
 
@@ -751,7 +857,7 @@ fn draw_confirm(f: &mut Frame, app: &App, confirm: &Confirm, area: Rect) {
                     }
                 ),
                 paths.iter().map(|p| display_name(p)).collect(),
-                "Folders are removed with everything inside. There is no undo.",
+                "Folders and their contents are removed (you can undo with u).",
                 "delete",
             ),
             Confirm::Overwrite { op, plan } => {
@@ -780,10 +886,18 @@ fn draw_confirm(f: &mut Frame, app: &App, confirm: &Confirm, area: Rect) {
                         op.label()
                     ),
                     clashes,
-                    "The existing items are deleted first. There is no undo.",
+                    "Existing items are backed up temporarily so you can undo with u.",
                     "replace",
                 )
             }
+            Confirm::Undo(label) => (
+                " Undo ",
+                t.accent,
+                format!("Undo {label}?"),
+                Vec::new(),
+                "This reverses the last file operation.",
+                "undo",
+            ),
         };
 
     let mut lines = vec![Line::styled(
@@ -824,7 +938,7 @@ fn draw_confirm(f: &mut Frame, app: &App, confirm: &Confirm, area: Rect) {
 
 fn draw_help(f: &mut Frame, app: &App, g: &Glyphs, area: Rect) {
     let t = &app.theme;
-    let rows: [(&str, &str); 20] = [
+    let rows: [(&str, &str); 24] = [
         ("↑ ↓  j k", "move selection"),
         ("enter", "open folder or file"),
         ("bksp  ←  h", "parent folder"),
@@ -836,8 +950,12 @@ fn draw_help(f: &mut Frame, app: &App, g: &Glyphs, area: Rect) {
             "copy / move: pick items, then go to the destination",
         ),
         ("p", "paste into the current folder"),
+        ("u", "undo the last copy, move, rename or delete"),
+        ("y", "copy selected item paths"),
+        ("Y", "copy current folder path"),
+        ("f", "search text inside files under this folder"),
         ("r", "rename the item under the cursor"),
-        ("d", "delete (always asks first)"),
+        ("d", "delete (asks first; undo with u)"),
         ("/", "filter by name"),
         ("esc", "clear filter, cancel copy/move, clear selection"),
         (".", "show / hide hidden files"),
