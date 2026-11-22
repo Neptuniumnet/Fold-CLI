@@ -129,7 +129,7 @@ cargo run -- --path /home/you/Documents
 | `Esc` | Close the current panel or clear a pending selection/filter |
 | `?` / `q` | Help / quit |
 
-Click the FOLD logo in Settings for the meow easter egg. `Ctrl+C` exits and restores the terminal.
+Click the FOLD logo in settings lol :). `Ctrl+C` exits and restores the terminal.
 
 ## Themes and options
 
